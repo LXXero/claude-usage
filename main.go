@@ -110,7 +110,7 @@ func getColor(pct float64) string {
 	switch {
 	case pct >= 85:
 		return red
-	case pct >= 70:
+	case pct >= 60:
 		return yellow
 	default:
 		return green
