@@ -267,14 +267,9 @@ func findSessionName(sessionID string) string {
 
 		for _, session := range index.Entries {
 			if session.SessionID == sessionID {
-				if session.CustomTitle != "" {
-					return session.CustomTitle
-				}
-				// Truncate first prompt if too long
-				if len(session.FirstPrompt) > 20 {
-					return session.FirstPrompt[:20] + "…"
-				}
-				return session.FirstPrompt
+				// Only return custom title, not firstPrompt
+				// Empty string triggers orange UUID display as rename reminder
+				return session.CustomTitle
 			}
 		}
 	}
