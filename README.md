@@ -18,8 +18,8 @@ A custom statusline for [Claude Code](https://claude.ai/code) that displays usag
 - Cache hit rate
 
 Colors indicate usage levels:
-- Green: < 70%
-- Yellow: 70-85%
+- Green: < 60%
+- Yellow: 60-85%
 - Red: > 85%
 
 ## Installation
