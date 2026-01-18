@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -102,6 +103,7 @@ const (
 	cyan    = "\033[36m"
 	blue    = "\033[34m"
 	magenta = "\033[35m"
+	orange  = "\033[38;5;208m"
 )
 
 func getColor(pct float64) string {
@@ -151,14 +153,32 @@ func formatTimeRemaining(resetsAt *string) string {
 }
 
 func getCredentials() (string, error) {
-	cmd := exec.Command("security", "find-generic-password", "-s", keychainService, "-w")
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("keychain error: %w", err)
+	var data []byte
+	var err error
+
+	if runtime.GOOS == "darwin" {
+		// macOS: use Keychain
+		cmd := exec.Command("security", "find-generic-password", "-s", keychainService, "-w")
+		data, err = cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("keychain error: %w", err)
+		}
+	} else {
+		// Linux: read from ~/.claude/.credentials.json
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("home dir error: %w", err)
+		}
+
+		credPath := filepath.Join(homeDir, ".claude", ".credentials.json")
+		data, err = os.ReadFile(credPath)
+		if err != nil {
+			return "", fmt.Errorf("credentials file error: %w", err)
+		}
 	}
 
 	var creds Credentials
-	if err := json.Unmarshal(output, &creds); err != nil {
+	if err := json.Unmarshal(data, &creds); err != nil {
 		return "", fmt.Errorf("parse error: %w", err)
 	}
 
@@ -329,10 +349,17 @@ func getCacheStats(transcriptPath string) (cacheRead, totalInput int) {
 }
 
 func main() {
-	var parts []string
+	var line1, line2 []string
 
 	// Read Claude Code input from stdin
 	input := readStdinInput()
+
+	// === LINE 1: Location & session info ===
+
+	// Model info (first)
+	if input != nil && input.Model.DisplayName != "" {
+		line1 = append(line1, fmt.Sprintf("%s%s%s", blue, input.Model.DisplayName, reset))
+	}
 
 	// Directory and git branch
 	if input != nil && input.Cwd != "" {
@@ -340,9 +367,9 @@ func main() {
 		branch := getGitBranch(input.Cwd)
 
 		if branch != "" {
-			parts = append(parts, fmt.Sprintf("%s%s%s %s%s%s", dim, dir, reset, magenta, branch, reset))
+			line1 = append(line1, fmt.Sprintf("%s%s%s %s%s%s", dim, dir, reset, magenta, branch, reset))
 		} else {
-			parts = append(parts, fmt.Sprintf("%s%s%s", dim, dir, reset))
+			line1 = append(line1, fmt.Sprintf("%s%s%s", dim, dir, reset))
 		}
 	}
 
@@ -350,44 +377,31 @@ func main() {
 	if input != nil && input.SessionID != "" {
 		sessionName := findSessionName(input.SessionID)
 		if sessionName != "" {
-			parts = append(parts, fmt.Sprintf("%s%s%s", cyan, sessionName, reset))
+			line1 = append(line1, fmt.Sprintf("%s%s%s", cyan, sessionName, reset))
 		} else {
-			// Show truncated session ID
-			shortID := input.SessionID[:8]
-			parts = append(parts, fmt.Sprintf("%s%s%s", dim, shortID, reset))
+			// Show full UUID in orange as reminder to rename
+			line1 = append(line1, fmt.Sprintf("%s%s%s", orange, input.SessionID, reset))
 		}
 	}
 
-	// Model info
-	if input != nil && input.Model.DisplayName != "" {
-		parts = append(parts, fmt.Sprintf("%s%s%s", blue, input.Model.DisplayName, reset))
-	}
+	// === LINE 2: Usage & metrics ===
 
 	// Context window
 	if input != nil && input.ContextWindow.ContextWindowSize > 0 {
 		pct := input.ContextWindow.UsedPercentage
 		color := getColor(pct)
 		bar := getBar(pct, 8)
-		parts = append(parts, fmt.Sprintf("%sctx %s %.0f%%%s", color, bar, pct, reset))
-	}
-
-	// Cache hit rate from transcript
-	if input != nil && input.TranscriptPath != "" {
-		cacheRead, totalInput := getCacheStats(input.TranscriptPath)
-		if totalInput > 0 && cacheRead > 0 {
-			cachePct := float64(cacheRead) / float64(totalInput) * 100
-			parts = append(parts, fmt.Sprintf("%scache %.0f%%%s", dim, cachePct, reset))
-		}
+		line2 = append(line2, fmt.Sprintf("%sctx %s %.0f%%%s", color, bar, pct, reset))
 	}
 
 	// Fetch API usage
 	token, err := getCredentials()
 	if err != nil {
-		parts = append(parts, fmt.Sprintf("%s⚠ auth%s", red, reset))
+		line2 = append(line2, fmt.Sprintf("%s⚠ auth%s", red, reset))
 	} else {
 		usage, err := fetchUsage(token)
 		if err != nil {
-			parts = append(parts, fmt.Sprintf("%s⚠ api%s", red, reset))
+			line2 = append(line2, fmt.Sprintf("%s⚠ api%s", red, reset))
 		} else {
 			// 5-hour limit
 			if usage.FiveHour != nil {
@@ -400,17 +414,32 @@ func main() {
 				if remaining != "" {
 					usageStr += fmt.Sprintf(" %s(%s)%s", dim, remaining, reset)
 				}
-				parts = append(parts, usageStr)
+				line2 = append(line2, usageStr)
 			}
 
 			// 7-day limit
 			if usage.SevenDay != nil {
 				pct := usage.SevenDay.Utilization
 				color := getColor(pct)
-				parts = append(parts, fmt.Sprintf("%s7d %.0f%%%s", color, pct, reset))
+				line2 = append(line2, fmt.Sprintf("%s7d %.0f%%%s", color, pct, reset))
 			}
 		}
 	}
 
-	fmt.Println(strings.Join(parts, " │ "))
+	// Cache hit rate from transcript (at end)
+	if input != nil && input.TranscriptPath != "" {
+		cacheRead, totalInput := getCacheStats(input.TranscriptPath)
+		if totalInput > 0 && cacheRead > 0 {
+			cachePct := float64(cacheRead) / float64(totalInput) * 100
+			line2 = append(line2, fmt.Sprintf("%scache %.0f%%%s", dim, cachePct, reset))
+		}
+	}
+
+	// Output both lines
+	if len(line1) > 0 {
+		fmt.Println(strings.Join(line1, " │ "))
+	}
+	if len(line2) > 0 {
+		fmt.Println(strings.Join(line2, " │ "))
+	}
 }
