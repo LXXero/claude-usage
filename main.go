@@ -233,11 +233,44 @@ func readStdinInput() *ClaudeInput {
 	return &input
 }
 
-func findSessionName(sessionID string) string {
+// CustomTitleEntry represents a rename event in the transcript
+type CustomTitleEntry struct {
+	Type        string `json:"type"`
+	CustomTitle string `json:"customTitle"`
+	SessionID   string `json:"sessionId"`
+}
+
+func findSessionName(sessionID, transcriptPath string) string {
 	if sessionID == "" {
 		return ""
 	}
 
+	// First: check transcript file for custom-title entries (most up-to-date)
+	// Read the LAST one since there can be multiple renames
+	if transcriptPath != "" {
+		if data, err := os.ReadFile(transcriptPath); err == nil {
+			lines := strings.Split(string(data), "\n")
+			var latestTitle string
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				var entry CustomTitleEntry
+				if err := json.Unmarshal([]byte(line), &entry); err != nil {
+					continue
+				}
+				if entry.Type == "custom-title" && entry.SessionID == sessionID && entry.CustomTitle != "" {
+					latestTitle = entry.CustomTitle
+				}
+			}
+			if latestTitle != "" {
+				return latestTitle
+			}
+		}
+	}
+
+	// Fallback: check sessions-index.json (may be slightly delayed)
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -370,7 +403,7 @@ func main() {
 
 	// Session info
 	if input != nil && input.SessionID != "" {
-		sessionName := findSessionName(input.SessionID)
+		sessionName := findSessionName(input.SessionID, input.TranscriptPath)
 		if sessionName != "" {
 			line1 = append(line1, fmt.Sprintf("%s%s%s", cyan, sessionName, reset))
 		} else {
