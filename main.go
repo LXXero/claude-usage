@@ -16,7 +16,14 @@ import (
 const (
 	keychainService = "Claude Code-credentials"
 	usageEndpoint   = "https://api.anthropic.com/api/oauth/usage"
+	cacheTTL        = 2 * time.Minute
 )
+
+// Cached usage response
+type CachedUsage struct {
+	Usage     *UsageResponse `json:"usage"`
+	FetchedAt int64          `json:"fetched_at"`
+}
 
 // Keychain credentials
 type OAuthToken struct {
@@ -185,7 +192,49 @@ func getCredentials() (string, error) {
 	return creds.ClaudeAiOauth.AccessToken, nil
 }
 
+func cachePath() string {
+	dir := os.TempDir()
+	return filepath.Join(dir, fmt.Sprintf("claude-usage-%d.json", os.Getuid()))
+}
+
+func readCache() (*CachedUsage, bool) {
+	data, err := os.ReadFile(cachePath())
+	if err != nil {
+		return nil, false
+	}
+
+	var cached CachedUsage
+	if err := json.Unmarshal(data, &cached); err != nil {
+		return nil, false
+	}
+
+	if time.Since(time.Unix(cached.FetchedAt, 0)) > cacheTTL {
+		return nil, false
+	}
+
+	return &cached, true
+}
+
+func writeCache(usage *UsageResponse) {
+	cached := CachedUsage{
+		Usage:     usage,
+		FetchedAt: time.Now().Unix(),
+	}
+	data, err := json.Marshal(cached)
+	if err != nil {
+		return
+	}
+	os.WriteFile(cachePath(), data, 0600)
+}
+
 func fetchUsage(token string) (*UsageResponse, error) {
+	if cached, ok := readCache(); ok {
+		if cached.Usage == nil {
+			return nil, fmt.Errorf("cached failure")
+		}
+		return cached.Usage, nil
+	}
+
 	req, err := http.NewRequest("GET", usageEndpoint, nil)
 	if err != nil {
 		return nil, err
@@ -202,6 +251,7 @@ func fetchUsage(token string) (*UsageResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		writeCache(nil)
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
@@ -209,6 +259,8 @@ func fetchUsage(token string) (*UsageResponse, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&usage); err != nil {
 		return nil, err
 	}
+
+	writeCache(&usage)
 
 	return &usage, nil
 }
