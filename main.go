@@ -4,45 +4,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
 
-const (
-	keychainService = "Claude Code-credentials"
-	usageEndpoint   = "https://api.anthropic.com/api/oauth/usage"
-	cacheTTL        = 2 * time.Minute
-)
-
-// Cached usage response
-type CachedUsage struct {
-	Usage     *UsageResponse `json:"usage"`
-	FetchedAt int64          `json:"fetched_at"`
+// Rate limits from Claude Code stdin
+type RateLimit struct {
+	UsedPercentage float64  `json:"used_percentage"`
+	ResetsAt       *float64 `json:"resets_at"`
 }
 
-// Keychain credentials
-type OAuthToken struct {
-	AccessToken string `json:"accessToken"`
-}
-
-type Credentials struct {
-	ClaudeAiOauth OAuthToken `json:"claudeAiOauth"`
-}
-
-// API response
-type UsageLimit struct {
-	Utilization float64 `json:"utilization"`
-	ResetsAt    *string `json:"resets_at"`
-}
-
-type UsageResponse struct {
-	FiveHour *UsageLimit `json:"five_hour"`
-	SevenDay *UsageLimit `json:"seven_day"`
+type RateLimits struct {
+	FiveHour *RateLimit `json:"five_hour"`
+	SevenDay *RateLimit `json:"seven_day"`
 }
 
 // Claude Code stdin input
@@ -73,6 +50,7 @@ type ClaudeInput struct {
 	Model          Model         `json:"model"`
 	Workspace      Workspace     `json:"workspace"`
 	ContextWindow  ContextWindow `json:"context_window"`
+	RateLimits     *RateLimits   `json:"rate_limits"`
 }
 
 // Session index
@@ -113,6 +91,10 @@ const (
 	orange  = "\033[38;5;208m"
 )
 
+func clearToEOL(s string) string {
+	return s + "\033[0K"
+}
+
 func getColor(pct float64) string {
 	switch {
 	case pct >= 85:
@@ -135,16 +117,12 @@ func getBar(pct float64, width int) string {
 	return bar
 }
 
-func formatTimeRemaining(resetsAt *string) string {
+func formatTimeRemaining(resetsAt *float64) string {
 	if resetsAt == nil {
 		return ""
 	}
 
-	resetTime, err := time.Parse(time.RFC3339, *resetsAt)
-	if err != nil {
-		return ""
-	}
-
+	resetTime := time.Unix(int64(*resetsAt), 0)
 	remaining := time.Until(resetTime)
 	if remaining < 0 {
 		return "now"
@@ -157,112 +135,6 @@ func formatTimeRemaining(resetsAt *string) string {
 		return fmt.Sprintf("%dh%dm", hours, mins)
 	}
 	return fmt.Sprintf("%dm", mins)
-}
-
-func getCredentials() (string, error) {
-	var data []byte
-	var err error
-
-	if runtime.GOOS == "darwin" {
-		// macOS: use Keychain
-		cmd := exec.Command("security", "find-generic-password", "-s", keychainService, "-w")
-		data, err = cmd.Output()
-		if err != nil {
-			return "", fmt.Errorf("keychain error: %w", err)
-		}
-	} else {
-		// Linux: read from ~/.claude/.credentials.json
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("home dir error: %w", err)
-		}
-
-		credPath := filepath.Join(homeDir, ".claude", ".credentials.json")
-		data, err = os.ReadFile(credPath)
-		if err != nil {
-			return "", fmt.Errorf("credentials file error: %w", err)
-		}
-	}
-
-	var creds Credentials
-	if err := json.Unmarshal(data, &creds); err != nil {
-		return "", fmt.Errorf("parse error: %w", err)
-	}
-
-	return creds.ClaudeAiOauth.AccessToken, nil
-}
-
-func cachePath() string {
-	dir := os.TempDir()
-	return filepath.Join(dir, fmt.Sprintf("claude-usage-%d.json", os.Getuid()))
-}
-
-func readCache() (*CachedUsage, bool) {
-	data, err := os.ReadFile(cachePath())
-	if err != nil {
-		return nil, false
-	}
-
-	var cached CachedUsage
-	if err := json.Unmarshal(data, &cached); err != nil {
-		return nil, false
-	}
-
-	if time.Since(time.Unix(cached.FetchedAt, 0)) > cacheTTL {
-		return nil, false
-	}
-
-	return &cached, true
-}
-
-func writeCache(usage *UsageResponse) {
-	cached := CachedUsage{
-		Usage:     usage,
-		FetchedAt: time.Now().Unix(),
-	}
-	data, err := json.Marshal(cached)
-	if err != nil {
-		return
-	}
-	os.WriteFile(cachePath(), data, 0600)
-}
-
-func fetchUsage(token string) (*UsageResponse, error) {
-	if cached, ok := readCache(); ok {
-		if cached.Usage == nil {
-			return nil, fmt.Errorf("cached failure")
-		}
-		return cached.Usage, nil
-	}
-
-	req, err := http.NewRequest("GET", usageEndpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		writeCache(nil)
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	var usage UsageResponse
-	if err := json.NewDecoder(resp.Body).Decode(&usage); err != nil {
-		return nil, err
-	}
-
-	writeCache(&usage)
-
-	return &usage, nil
 }
 
 func readStdinInput() *ClaudeInput {
@@ -436,9 +308,19 @@ func main() {
 
 	// === LINE 1: Location & session info ===
 
-	// Model info (first)
-	if input != nil && input.Model.DisplayName != "" {
-		line1 = append(line1, fmt.Sprintf("%s%s%s", blue, input.Model.DisplayName, reset))
+	// Model info (first) - use short ID like "opus-4-6 (1m)"
+	if input != nil && input.Model.ID != "" {
+		// Strip "claude-" prefix for brevity
+		shortModel := strings.TrimPrefix(input.Model.ID, "claude-")
+		// Extract context suffix like "[1m]" -> "(1m)"
+		if idx := strings.Index(shortModel, "["); idx != -1 {
+			suffix := shortModel[idx:]
+			shortModel = shortModel[:idx]
+			suffix = strings.Replace(suffix, "[", "(", 1)
+			suffix = strings.Replace(suffix, "]", ")", 1)
+			shortModel += " " + suffix
+		}
+		line1 = append(line1, fmt.Sprintf("%s%s%s", blue, shortModel, reset))
 	}
 
 	// Directory and git branch
@@ -474,39 +356,31 @@ func main() {
 		line2 = append(line2, fmt.Sprintf("%sctx %s %.0f%%%s", color, bar, pct, reset))
 	}
 
-	// Fetch API usage
-	token, err := getCredentials()
-	if err != nil {
-		line2 = append(line2, fmt.Sprintf("%s⚠ auth%s", red, reset))
-	} else {
-		usage, err := fetchUsage(token)
-		if err != nil {
-			line2 = append(line2, fmt.Sprintf("%s⚠ api%s", red, reset))
-		} else {
-			// 5-hour limit
-			if usage.FiveHour != nil {
-				pct := usage.FiveHour.Utilization
-				color := getColor(pct)
-				bar := getBar(pct, 10)
-				remaining := formatTimeRemaining(usage.FiveHour.ResetsAt)
+	// Rate limits from stdin
+	if input != nil && input.RateLimits != nil {
+		// 5-hour limit
+		if input.RateLimits.FiveHour != nil {
+			pct := input.RateLimits.FiveHour.UsedPercentage
+			color := getColor(pct)
+			bar := getBar(pct, 10)
+			remaining := formatTimeRemaining(input.RateLimits.FiveHour.ResetsAt)
 
-				usageStr := fmt.Sprintf("%s5h %s %.0f%%%s", color, bar, pct, reset)
-				if remaining != "" {
-					usageStr += fmt.Sprintf(" %s(%s)%s", dim, remaining, reset)
-				}
-				line2 = append(line2, usageStr)
+			usageStr := fmt.Sprintf("%s5h %s %.0f%%%s", color, bar, pct, reset)
+			if remaining != "" {
+				usageStr += fmt.Sprintf(" %s(%s)%s", dim, remaining, reset)
 			}
+			line2 = append(line2, usageStr)
+		}
 
-			// 7-day limit
-			if usage.SevenDay != nil {
-				pct := usage.SevenDay.Utilization
-				color := getColor(pct)
-				line2 = append(line2, fmt.Sprintf("%s7d %.0f%%%s", color, pct, reset))
-			}
+		// 7-day limit
+		if input.RateLimits.SevenDay != nil {
+			pct := input.RateLimits.SevenDay.UsedPercentage
+			color := getColor(pct)
+			line2 = append(line2, fmt.Sprintf("%s7d %.0f%%%s", color, pct, reset))
 		}
 	}
 
-	// Cache hit rate from transcript (at end)
+	// Cache hit rate from transcript
 	if input != nil && input.TranscriptPath != "" {
 		cacheRead, totalInput := getCacheStats(input.TranscriptPath)
 		if totalInput > 0 && cacheRead > 0 {
@@ -515,11 +389,12 @@ func main() {
 		}
 	}
 
-	// Output both lines
+	// Output both lines, padded to terminal width to prevent
+	// Claude Code from overlaying indicators on the right side
 	if len(line1) > 0 {
-		fmt.Println(strings.Join(line1, " │ "))
+		fmt.Println(clearToEOL(strings.Join(line1, " │ ")))
 	}
 	if len(line2) > 0 {
-		fmt.Println(strings.Join(line2, " │ "))
+		fmt.Println(clearToEOL(strings.Join(line2, " │ ")))
 	}
 }
