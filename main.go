@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ const (
 	keychainService = "Claude Code-credentials"
 	usageEndpoint   = "https://api.anthropic.com/api/oauth/usage"
 	cacheTTL        = 2 * time.Minute
+	prCacheTTL      = 90 * time.Second
 )
 
 // Cached usage response
@@ -376,6 +378,101 @@ func getGitBranch(dir string) string {
 	return strings.TrimSpace(string(output))
 }
 
+// PR info from `gh pr view`
+type PRInfo struct {
+	Number int    `json:"number"`
+	URL    string `json:"url"`
+	State  string `json:"state"`
+}
+
+type CachedPR struct {
+	PR        *PRInfo `json:"pr"`
+	FetchedAt int64   `json:"fetched_at"`
+}
+
+type PRCacheFile struct {
+	Entries map[string]CachedPR `json:"entries"`
+}
+
+func prCachePath() string {
+	dir := os.TempDir()
+	return filepath.Join(dir, fmt.Sprintf("claude-usage-pr-%d.json", os.Getuid()))
+}
+
+func readPRCache(key string) (*PRInfo, bool) {
+	data, err := os.ReadFile(prCachePath())
+	if err != nil {
+		return nil, false
+	}
+
+	var cache PRCacheFile
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return nil, false
+	}
+
+	entry, ok := cache.Entries[key]
+	if !ok {
+		return nil, false
+	}
+
+	if time.Since(time.Unix(entry.FetchedAt, 0)) > prCacheTTL {
+		return nil, false
+	}
+
+	return entry.PR, true
+}
+
+func writePRCache(key string, pr *PRInfo) {
+	cache := PRCacheFile{Entries: map[string]CachedPR{}}
+	if data, err := os.ReadFile(prCachePath()); err == nil {
+		json.Unmarshal(data, &cache)
+		if cache.Entries == nil {
+			cache.Entries = map[string]CachedPR{}
+		}
+	}
+
+	cache.Entries[key] = CachedPR{PR: pr, FetchedAt: time.Now().Unix()}
+
+	data, err := json.Marshal(cache)
+	if err != nil {
+		return
+	}
+	os.WriteFile(prCachePath(), data, 0600)
+}
+
+// getGitPR looks up the PR associated with branch via `gh`. A nil *PRInfo
+// (with ok=true) means "looked up, no PR" and is cached to avoid repeat calls.
+func getGitPR(dir, branch string) *PRInfo {
+	if dir == "" || branch == "" {
+		return nil
+	}
+
+	key := dir + "@" + branch
+	if pr, ok := readPRCache(key); ok {
+		return pr
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", branch, "--json", "number,url,state")
+	cmd.Dir = dir
+	output, err := cmd.Output()
+	if err != nil {
+		writePRCache(key, nil) // cache "no PR" until TTL expires
+		return nil
+	}
+
+	var pr PRInfo
+	if err := json.Unmarshal(output, &pr); err != nil {
+		writePRCache(key, nil)
+		return nil
+	}
+
+	writePRCache(key, &pr)
+	return &pr
+}
+
 func shortenPath(cwd, projectDir string) string {
 	if cwd == "" {
 		return ""
@@ -447,7 +544,21 @@ func main() {
 		branch := getGitBranch(input.Cwd)
 
 		if branch != "" {
-			line1 = append(line1, fmt.Sprintf("%s%s%s %s%s%s", dim, dir, reset, magenta, branch, reset))
+			seg := fmt.Sprintf("%s%s%s %s%s%s", dim, dir, reset, magenta, branch, reset)
+			if pr := getGitPR(input.Cwd, branch); pr != nil {
+				// State-based color: open=green, merged=magenta, closed=red
+				prColor := green
+				switch strings.ToUpper(pr.State) {
+				case "MERGED":
+					prColor = magenta
+				case "CLOSED":
+					prColor = red
+				}
+				// OSC 8 hyperlink: clickable PR number in supporting terminals
+				link := fmt.Sprintf("\033]8;;%s\033\\#%d\033]8;;\033\\", pr.URL, pr.Number)
+				seg += fmt.Sprintf(" %s%s%s", prColor, link, reset)
+			}
+			line1 = append(line1, seg)
 		} else {
 			line1 = append(line1, fmt.Sprintf("%s%s%s", dim, dir, reset))
 		}
